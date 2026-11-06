@@ -7,6 +7,9 @@ from tkinter import ttk, messagebox
 
 from .capture import capture_region, desktop_bounds, dpi_aware
 from .core import ConfigStore, DEFAULTS, LANGUAGES, endpoint, translate
+from .diagram import parse_regions, render_translation
+from .image_view import ImageView
+from .window import resized_bounds, set_bounds, mouse_passthrough
 
 BG = '#F5F6FA'
 WHITE = '#FFFFFF'
@@ -102,6 +105,7 @@ class App:
         except Exception:
             self.config = DEFAULTS.copy()
             warning = '配置读取失败，请重新填写设置。原配置文件未修改。'
+        self.config_loaded = warning is None
         self.events = queue.Queue()
         self.busy = False
         self.job = 0
@@ -110,13 +114,14 @@ class App:
         self.selecting = False
         self.settings_win = None
         self.compact = False
+        self.passthrough = False
         self.ui_scale = root.winfo_fpixels('1i') / 96
         self.scaled = lambda value: round(value * self.ui_scale)
-        self.normal_size = (self.scaled(460), self.scaled(650))
+        self.normal_size = (self.scaled(self.config['window_width']), self.scaled(self.config['window_height']))
         self.drag = (0, 0)
         root.title('轻译 · Float Translate')
         root.geometry(f'{self.normal_size[0]}x{self.normal_size[1]}+160+120')
-        root.minsize(self.scaled(380), self.scaled(550))
+        root.minsize(self.scaled(380), self.scaled(480))
         root.overrideredirect(True)
         root.configure(bg=BG, highlightbackground='#DDE0EB', highlightthickness=1)
         root.attributes('-topmost', self.config['topmost'])
@@ -151,10 +156,23 @@ class App:
         button(row, '⇄', self.swap).pack(side='left', padx=5)
         self.target_box = ttk.Combobox(row, textvariable=self.target, values=LANGUAGES, width=13)
         self.target_box.pack(side='left', fill='x', expand=True)
+        options = tk.Frame(self.body, bg=BG)
+        options.pack(fill='x', pady=(8, 0))
+        self.image_mode = tk.BooleanVar(value=self.config['image_mode'])
+        tk.Checkbutton(options, text='图片译文', variable=self.image_mode, bg=BG, activebackground=BG).pack(side='left')
+        self.passthrough_btn = button(options, '鼠标穿透', self.toggle_passthrough)
+        self.passthrough_btn.pack(side='right')
+        opacity_row = tk.Frame(self.body, bg=BG)
+        opacity_row.pack(fill='x')
+        self.opacity = tk.DoubleVar(value=self.config['opacity'])
+        self.opacity_label = tk.StringVar()
+        tk.Label(opacity_row, textvariable=self.opacity_label, bg=BG, fg=MUTED, width=13, anchor='w').pack(side='left')
+        ttk.Scale(opacity_row, from_=20, to=100, variable=self.opacity, command=self.apply_opacity).pack(side='left', fill='x', expand=True)
+        self.apply_opacity()
         tk.Label(self.body, text='原文', bg=BG, fg=MUTED, anchor='w').pack(fill='x', pady=(17, 6))
         input_card = tk.Frame(self.body, bg=WHITE, padx=11, pady=9)
-        input_card.pack(fill='both', expand=True)
-        self.input = tk.Text(input_card, height=5, wrap='word', bg=WHITE, fg=INK, insertbackground=ACCENT,
+        input_card.pack(fill='x')
+        self.input = tk.Text(input_card, height=3, wrap='word', bg=WHITE, fg=INK, insertbackground=ACCENT,
                              relief='flat', undo=True, font=('Microsoft YaHei UI', 11), spacing3=5)
         self.input.pack(fill='both', expand=True)
         self.input.bind('<Control-Return>', lambda e: self.run_text())
@@ -171,8 +189,12 @@ class App:
         result_header.pack(fill='x')
         tk.Label(result_header, text='译文', bg=BG, fg=MUTED).pack(side='left')
         button(result_header, '复制', self.copy).pack(side='right')
-        output_card = tk.Frame(self.body, bg=WHITE, padx=11, pady=9)
-        output_card.pack(fill='both', expand=True, pady=(5, 0))
+        self.results = ttk.Notebook(self.body)
+        self.results.pack(fill='both', expand=True, pady=(5, 0))
+        output_card = tk.Frame(self.results, bg=WHITE, padx=11, pady=9)
+        self.results.add(output_card, text='文字译文')
+        self.image_view = ImageView(self.results)
+        self.results.add(self.image_view, text='图片译文 / 原图')
         self.output = tk.Text(output_card, height=7, wrap='word', bg=WHITE, fg=INK, relief='flat',
                               state='disabled', font=('Microsoft YaHei UI', 11), spacing3=6)
         scroll = ttk.Scrollbar(output_card, command=self.output.yview)
@@ -180,21 +202,36 @@ class App:
         self.output.configure(yscrollcommand=scroll.set)
         self.output.pack(fill='both', expand=True)
         self.footer = tk.Frame(root, bg=BG)
-        self.footer.pack(fill='x', padx=18, pady=(0, 10))
+        self.footer.pack(fill='x', side='bottom', before=self.body, padx=18, pady=(0, 10))
         self.status = tk.StringVar(value='就绪 · Ctrl+Enter 翻译')
         tk.Label(self.footer, textvariable=self.status, bg=BG, fg=MUTED, anchor='w', font=('Microsoft YaHei UI', 9)).pack(side='left', fill='x', expand=True)
         grip = tk.Label(self.footer, text='◢', bg=BG, fg=MUTED, cursor='sizing')
         grip.pack(side='right')
         grip.bind('<ButtonPress-1>', self.resize_start)
         grip.bind('<B1-Motion>', self.resize)
+        self.resize_handles = []
+        for edges, cursor, placement in [
+                ('n', 'size_ns', dict(relx=0, rely=0, relwidth=1, height=5)),
+                ('s', 'size_ns', dict(relx=0, rely=1, relwidth=1, height=5, anchor='sw')),
+                ('w', 'size_we', dict(relx=0, rely=0, relheight=1, width=5)),
+                ('e', 'size_we', dict(relx=1, rely=0, relheight=1, width=5, anchor='ne')),
+                ('nw', 'size_nw_se', dict(relx=0, rely=0, width=10, height=10)),
+                ('ne', 'size_ne_sw', dict(relx=1, rely=0, width=10, height=10, anchor='ne')),
+                ('sw', 'size_ne_sw', dict(relx=0, rely=1, width=10, height=10, anchor='sw')),
+                ('se', 'size_nw_se', dict(relx=1, rely=1, width=10, height=10, anchor='se'))]:
+            handle = tk.Frame(root, bg=BG, cursor=cursor)
+            handle.place(**placement)
+            handle.bind('<ButtonPress-1>', lambda event, edge=edges: self.resize_start(event, edge))
+            handle.bind('<B1-Motion>', self.resize)
+            self.resize_handles.append((handle, placement))
         root.bind('<Escape>', lambda e: self.cancel_job())
         self.hotkeys = []
         user = ctypes.windll.user32
-        for ident, key in ((1, 0x41), (2, 0x54)):
+        for ident, key in ((1, 0x41), (2, 0x54), (3, 0x50)):
             if user.RegisterHotKey(None, ident, 0x4003, key):
                 self.hotkeys.append(ident)
         self.root.after(100, self.poll)
-        if len(self.hotkeys) != 2:
+        if len(self.hotkeys) != 3:
             self.status.set('部分快捷键被占用，请使用窗口按钮')
         if warning:
             root.after(300, lambda: messagebox.showwarning('配置提示', warning, parent=root))
@@ -214,6 +251,23 @@ class App:
         self.root.withdraw()
         self.root.deiconify()
 
+    def apply_opacity(self, value=None):
+        opacity = max(20, min(100, round(self.opacity.get())))
+        self.root.attributes('-alpha', opacity / 100)
+        self.config['opacity'] = opacity
+        self.opacity_label.set(f'不透明度 {opacity}%')
+        if self.passthrough:
+            mouse_passthrough(self.root, True)
+
+    def toggle_passthrough(self):
+        if not self.passthrough and 3 not in self.hotkeys:
+            self.status.set('Ctrl+Alt+P 被占用，无法开启穿透；请先解除快捷键冲突')
+            return
+        self.passthrough = not self.passthrough
+        mouse_passthrough(self.root, self.passthrough)
+        self.title.configure(text='◈  穿透中' if self.passthrough else '◈  轻译')
+        self.status.set('鼠标穿透已开启 · Ctrl+Alt+P 解除' if self.passthrough else '鼠标穿透已关闭')
+
     def drag_start(self, event):
         self.drag = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
 
@@ -224,16 +278,22 @@ class App:
         user.SetWindowPos(user.GetParent(self.root.winfo_id()), None,
                           event.x_root - self.drag[0], event.y_root - self.drag[1], 0, 0, 0x0015)
 
-    def resize_start(self, event):
-        self.resize_origin = (event.x_root, event.y_root, self.root.winfo_width(), self.root.winfo_height())
+    def resize_start(self, event, edges='se'):
+        self.resize_edges = edges
+        self.resize_origin = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y(),
+                              self.root.winfo_width(), self.root.winfo_height())
 
     def resize(self, event):
-        x, y, width, height = self.resize_origin
-        self.root.geometry(f'{max(self.scaled(380), width + event.x_root - x)}x{max(self.scaled(550), height + event.y_root - y)}')
+        x, y, left, top, width, height = self.resize_origin
+        bounds = resized_bounds((left, top, width, height), event.x_root - x, event.y_root - y,
+                                self.resize_edges, (self.scaled(380), self.scaled(480)))
+        set_bounds(self.root, bounds)
 
     def toggle_compact(self):
         self.compact = not self.compact
         if self.compact:
+            for handle, _ in self.resize_handles:
+                handle.place_forget()
             self.normal_size = (self.root.winfo_width(), self.root.winfo_height())
             self.body.pack_forget()
             self.footer.pack_forget()
@@ -243,11 +303,13 @@ class App:
             self.collapse_btn.configure(text='□')
         else:
             self.mini_capture.pack_forget()
-            self.root.minsize(self.scaled(380), self.scaled(550))
+            self.root.minsize(self.scaled(380), self.scaled(480))
             self.root.geometry(f'{self.normal_size[0]}x{self.normal_size[1]}')
             self.body.pack(fill='both', expand=True)
-            self.footer.pack(fill='x', padx=18, pady=(0, 10))
+            self.footer.pack(fill='x', side='bottom', before=self.body, padx=18, pady=(0, 10))
             self.collapse_btn.configure(text='−')
+            for handle, placement in self.resize_handles:
+                handle.place(**placement)
 
     def restore(self):
         self.root.deiconify()
@@ -256,6 +318,8 @@ class App:
     def expand(self):
         if self.selector:
             return
+        if self.passthrough:
+            self.toggle_passthrough()
         if self.compact:
             self.toggle_compact()
         self.restore()
@@ -291,6 +355,8 @@ class App:
             self.settings()
             return
         self.selecting = True
+        if self.passthrough:
+            self.toggle_passthrough()
         self.root.withdraw()
         self.root.after(180, self.open_selector)
 
@@ -306,6 +372,7 @@ class App:
     def capture(self, region):
         try:
             self.image = capture_region(*region)
+            self.image_view.load_capture(self.image)
             self.input.delete('1.0', 'end')
             self.image_note.set(f'已选截图 {region[2]} × {region[3]} · 输入文字可切回文字翻译')
         except Exception as exc:
@@ -335,12 +402,23 @@ class App:
             return
         self.job += 1
         ident = self.job
+        diagram = image is not None and self.image_mode.get()
+        self.results.select(self.image_view if diagram else 0)
+        if diagram:
+            self.image_view.load_capture(image)
         self.set_busy(True)
-        self.status.set('正在翻译… · Esc 取消等待')
+        self.status.set('正在定位文字并生成图片译文…' if diagram else '正在翻译… · Esc 取消等待')
         self.set_output('')
         def worker():
             try:
-                result = translate(config, text=text, image=image)
+                if diagram:
+                    response = translate(config, image=image, diagram=True)
+                    regions = parse_regions(response)
+                    original, translated = render_translation(image, regions)
+                    result = dict(text='\n\n'.join(r['text'] for r in regions) if regions else '未识别到可读文字。',
+                                  original=original, translated=translated, count=len(regions))
+                else:
+                    result = translate(config, text=text, image=image)
                 self.events.put((ident, True, result))
             except Exception as exc:
                 self.events.put((ident, False, str(exc)))
@@ -365,9 +443,15 @@ class App:
                     continue
                 self.set_busy(False)
                 if ok:
-                    self.set_output(result)
-                    self.status.set('翻译完成')
+                    if isinstance(result, dict):
+                        self.set_output(result['text'])
+                        self.image_view.set_images(result['original'], result['translated'])
+                        self.status.set(f'图片译文完成 · {result["count"]} 处文字 · 请对照原图核对')
+                    else:
+                        self.set_output(result)
+                        self.status.set('翻译完成')
                 else:
+                    self.results.select(0)
                     self.status.set('翻译失败 · 可重试')
                     self.set_output(result)
         except queue.Empty:
@@ -378,6 +462,8 @@ class App:
                 self.screenshot()
             elif msg.wParam == 2:
                 self.expand()
+            elif msg.wParam == 3:
+                self.toggle_passthrough()
         self.root.after(80, self.poll)
 
     def set_output(self, text):
@@ -396,6 +482,7 @@ class App:
     def clear(self):
         self.cancel_job()
         self.image = None
+        self.image_view.clear()
         self.input.delete('1.0', 'end')
         self.set_output('')
         self.image_note.set('输入文字，或框选屏幕中的内容')
@@ -404,6 +491,8 @@ class App:
     def settings(self):
         if self.selector:
             return
+        if self.passthrough:
+            self.toggle_passthrough()
         if self.settings_win and self.settings_win.winfo_exists():
             self.settings_win.lift()
             return
@@ -426,7 +515,7 @@ class App:
             entries[key] = var
         topmost = tk.BooleanVar(value=self.config['topmost'])
         tk.Checkbutton(frame, text='窗口始终置顶', variable=topmost, bg=BG, activebackground=BG).pack(anchor='w', pady=(12, 4))
-        tk.Label(frame, text='Ctrl+Alt+A  截图    ·    Ctrl+Alt+T  展开窗口\n截图仅保留在内存，翻译时发送至所配置的接口。\n密钥通过 Windows DPAPI 加密，仅当前 Windows 用户可解密。',
+        tk.Label(frame, text='Ctrl+Alt+A 截图 · Ctrl+Alt+T 展开 · Ctrl+Alt+P 解除穿透\n截图保留在内存；仅在主动导出 PNG 时保存到磁盘。\n密钥通过 Windows DPAPI 加密，仅当前 Windows 用户可解密。',
                  bg=BG, fg=MUTED, justify='left', font=('Microsoft YaHei UI', 9)).pack(anchor='w', pady=8)
         def save():
             try:
@@ -439,9 +528,11 @@ class App:
                     raise ValueError('超时应为 5–300 秒。')
                 if not config['model']:
                     raise ValueError('请填写模型名称。')
-                config.update(topmost=topmost.get(), source=self.source.get(), target=self.target.get())
+                config.update(topmost=topmost.get(), source=self.source.get(), target=self.target.get(),
+                              opacity=round(self.opacity.get()), image_mode=self.image_mode.get())
                 self.store.save(config)
                 self.config = config
+                self.config_loaded = True
                 self.root.attributes('-topmost', config['topmost'])
                 self.status.set('设置已保存')
                 win.destroy()
@@ -455,8 +546,11 @@ class App:
     def close(self):
         try:
             # Do not overwrite a damaged config merely by closing the app.
-            if self.config.get('model'):
-                self.config.update(source=self.source.get(), target=self.target.get())
+            if self.config_loaded:
+                width, height = self.normal_size if self.compact else (self.root.winfo_width(), self.root.winfo_height())
+                self.config.update(source=self.source.get(), target=self.target.get(),
+                                   window_width=round(width / self.ui_scale), window_height=round(height / self.ui_scale),
+                                   opacity=round(self.opacity.get()), image_mode=self.image_mode.get())
                 self.store.save(self.config)
         except Exception as exc:
             messagebox.showerror('配置保存失败', str(exc), parent=self.root)

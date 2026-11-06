@@ -10,6 +10,7 @@ import zlib
 
 from src.capture import encode_png, capture_region, dpi_aware, desktop_bounds
 from src.core import ConfigStore, DEFAULTS, TranslationError, endpoint, translate
+from src.diagram import parse_regions
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -27,7 +28,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.mode == 'invalid':
             self.wfile.write(b'<html>bad gateway</html>')
         else:
-            self.wfile.write(json.dumps({'choices': [{'message': {'content': '你好'}, 'finish_reason': 'stop'}]}).encode())
+            text = json.dumps({'regions': [{'bbox': [10, 20, 200, 100], 'source': 'Input', 'text': '输入'}]}) if self.mode == 'diagram' else '你好'
+            self.wfile.write(json.dumps({'choices': [{'message': {'content': text}, 'finish_reason': 'stop'}]}).encode())
 
 
 class CoreTests(unittest.TestCase):
@@ -58,6 +60,13 @@ class CoreTests(unittest.TestCase):
         msg = Handler.payload['messages']
         self.assertIn('Automatically detect', msg[0]['content'])
         self.assertTrue(msg[1]['content'][1]['image_url']['url'].startswith('data:image/png;base64,iVBOR'))
+
+    def test_diagram_api_requests_coordinates_and_translation(self):
+        Handler.mode = 'diagram'
+        result = translate(self.config, image=encode_png(1, 1, bytes([0, 0, 255, 255])), diagram=True)
+        self.assertEqual(parse_regions(result)[0]['text'], '输入')
+        self.assertIn('0..1000', Handler.payload['messages'][0]['content'])
+        self.assertIn('简体中文', Handler.payload['messages'][0]['content'])
 
     def test_error_responses(self):
         Handler.mode = 'unauthorized'
@@ -90,6 +99,18 @@ class CoreTests(unittest.TestCase):
             self.config['api_key'] = ''
             store.save(self.config)
             self.assertEqual(store.load()['api_key'], '')
+
+    def test_window_preferences_round_trip_and_legacy_defaults(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = ConfigStore(Path(folder) / 'config.json')
+            config = dict(DEFAULTS, opacity=60, window_width=640, window_height=800, image_mode=False)
+            store.save(config)
+            loaded = store.load()
+            for key in ('opacity', 'window_width', 'window_height', 'image_mode'):
+                self.assertEqual(loaded[key], config[key])
+            store.path.write_text('{"source":"English","target":"简体中文"}', encoding='utf-8')
+            self.assertEqual(store.load()['opacity'], 100)
+            self.assertTrue(store.load()['image_mode'])
 
     @unittest.skipUnless(os.name == 'nt', 'Windows screen capture')
     def test_real_gdi_capture(self):
